@@ -27,6 +27,12 @@ hostinfo() {
 	} > "$local_dir/hostinfo-$1.txt" 2>&1
 }
 
+# Stop the /proc sampler before copying, so it cannot append after cleanup.
+stop_sampler() {
+	kill "$1" 2>/dev/null || true
+	wait "$1" 2>/dev/null || true
+}
+
 finish() {
 	cp -r "$local_dir"/. "$OUT"/
 	rm -rf "$local_dir"
@@ -50,7 +56,7 @@ relay)
 	sleep "$RELAY_SECS"
 	kill -TERM "$relay" 2>/dev/null || true
 	wait "$relay" || true
-	wait "$sampler" || true
+	stop_sampler "$sampler"
 	finish
 	;;
 pub)
@@ -63,8 +69,9 @@ pub)
 	"$BIN/moq-bench-pub" "${args[@]}" > "$local_dir/pub.log" 2>&1 &
 	pub=$!
 	"$here/sample-proc.sh" "$pub" "$local_dir/pub-proc.csv" 1 &
+	sampler=$!
 	wait "$pub" || echo "publisher exited with $?" >> "$local_dir/pub.log"
-	wait || true
+	stop_sampler "$sampler"
 	finish
 	;;
 sub)
@@ -84,8 +91,9 @@ sub)
 	"$BIN/moq-bench-sub" "${args[@]}" > "$local_dir/$label.log" 2>&1 &
 	sub=$!
 	"$here/sample-proc.sh" "$sub" "$local_dir/$label-proc.csv" 1 &
+	sampler=$!
 	wait "$sub" || echo "subscriber exited with $?" >> "$local_dir/$label.log"
-	wait || true
+	stop_sampler "$sampler"
 	finish
 	;;
 *)
