@@ -214,6 +214,18 @@ pub struct Config {
     /// Optional hook to wrap the [`quinn::AsyncUdpSocket`] before endpoint
     /// creation. Defaults to `None` (no wrapping). See [`SocketWrapperFn`].
     pub socket_wrapper: Option<SocketWrapperFn>,
+    /// Flow-control windows for outbound (client) connections. Defaults to
+    /// `None`, keeping quinn's defaults. See [`Config::with_client_receive_windows`].
+    pub client_receive_windows: Option<ReceiveWindows>,
+}
+
+/// QUIC receive flow-control windows, in bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiveWindows {
+    /// Connection-wide receive window (`initial_max_data`).
+    pub connection: u64,
+    /// Per-stream receive window (`initial_max_stream_data_*`).
+    pub stream: u64,
 }
 
 impl Config {
@@ -231,6 +243,7 @@ impl Config {
             tls,
             tags: HashSet::new(),
             socket_wrapper: None,
+            client_receive_windows: None,
         })
     }
 
@@ -255,7 +268,17 @@ impl Config {
             tls,
             tags: HashSet::new(),
             socket_wrapper: None,
+            client_receive_windows: None,
         }
+    }
+
+    /// Shrink (or grow) the receive windows advertised on client connections.
+    ///
+    /// Small windows make a slow-reading client push back on its sender
+    /// quickly instead of buffering seconds of media inside quinn.
+    pub fn with_client_receive_windows(mut self, windows: ReceiveWindows) -> Self {
+        self.client_receive_windows = Some(windows);
+        self
     }
 
     pub fn with_tag(mut self, tag: String) -> Self {
@@ -354,10 +377,21 @@ impl Endpoint {
             base_server_config: Arc::new(base_server_config),
         });
 
+        let client_transport = match config.client_receive_windows {
+            Some(windows) => {
+                let mut client_transport = build_transport_config();
+                client_transport
+                    .receive_window(quinn::VarInt::from_u64(windows.connection)?)
+                    .stream_receive_window(quinn::VarInt::from_u64(windows.stream)?);
+                Arc::new(client_transport)
+            }
+            None => transport,
+        };
+
         let client = Client {
             quic,
             config: config.tls.client,
-            transport,
+            transport: client_transport,
             is_dual_stack: config.is_dual_stack,
         };
 

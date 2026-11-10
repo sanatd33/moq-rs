@@ -10,6 +10,7 @@ use futures::StreamExt;
 
 use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase};
 use crate::data::DataStreamResetCode;
+use crate::instrument;
 use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
@@ -542,6 +543,8 @@ impl ObjectForwarder {
         let mut tasks = FuturesUnordered::new();
         let mut acknowledgements = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
+        let probe =
+            instrument::SubscriptionGuard::new(self.publisher.session_id().as_str(), &subgroups);
 
         loop {
             tokio::select! {
@@ -571,9 +574,10 @@ impl ObjectForwarder {
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
                         let session_id = self.publisher.session_id().clone();
+                        let subgroup_probe = probe.as_ref().and_then(|p| p.subgroup(&subgroup));
 
                         tasks.push(async move {
-                            let res = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await;
+                            let res = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter, subgroup_probe.as_ref()).await;
                             if let Err(err) = &res {
                                 if Subscribed::is_expected_serve_shutdown(err) {
                                     tracing::debug!(session_id = %session_id, subgroup_info = ?info, error = %err, "stopped serving subgroup");
@@ -595,6 +599,9 @@ impl ObjectForwarder {
                             // End this subscription instead. Dropping both sets
                             // resets all retained streams with Cancelled, trading
                             // continued delivery for a hard resource bound.
+                            if let Some(probe) = &probe {
+                                probe.too_far_behind();
+                            }
                             return Err(ServeError::Closed(message::PublishDoneCode::TooFarBehind as u64).into());
                         }
                         acknowledgements.push(async move { output.acknowledged().await });
@@ -612,6 +619,7 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
+        probe: Option<&instrument::SubgroupGuard>,
     ) -> Result<Option<SubgroupOutput>, SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
@@ -647,6 +655,7 @@ impl ObjectForwarder {
             state,
             mlog,
             delivery_filter,
+            probe,
         )
         .await;
 
@@ -703,6 +712,7 @@ impl ObjectForwarder {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve_subgroup_objects(
         header: data::SubgroupHeader,
         mut subgroup_reader: serve::SubgroupReader,
@@ -711,6 +721,7 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
+        probe: Option<&instrument::SubgroupGuard>,
     ) -> Result<(), SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
@@ -817,7 +828,13 @@ impl ObjectForwarder {
                     chunk.len()
                 );
                 bytes_sent += chunk.len();
+                if let Some(limit) = instrument::send_limit() {
+                    limit.acquire(chunk.len()).await;
+                }
                 output.write(&chunk).await?;
+                if let Some(probe) = probe {
+                    probe.wrote(chunk.len());
+                }
                 chunks_sent += 1;
             }
 
@@ -843,6 +860,9 @@ impl ObjectForwarder {
                 return Err(ServeError::Size.into());
             }
 
+            if let Some(probe) = probe {
+                probe.object_done();
+            }
             object_count += 1;
         }
 
@@ -903,6 +923,7 @@ impl ObjectForwarder {
             state,
             None,
             delivery_filter,
+            None,
         )
         .await;
 

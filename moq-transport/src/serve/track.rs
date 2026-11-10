@@ -74,12 +74,28 @@ impl Default for TrackState {
 pub struct TrackWriter {
     state: State<TrackState>,
     pub info: Arc<Track>,
+    deliver_all_subgroups: bool,
 }
 
 impl TrackWriter {
     /// Create a track with the given name (info/Track)
     fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+        Self {
+            state,
+            info,
+            deliver_all_subgroups: false,
+        }
+    }
+
+    /// Hand every received subgroup to the reader, not only the latest.
+    ///
+    /// By default a `SubgroupsReader` only observes the newest subgroup; any
+    /// subgroup it did not pick up in time, or one arriving after a newer
+    /// group, loses its last reader and its stream is cancelled. Measurement
+    /// clients that must account for every object opt in here.
+    pub fn deliver_all_subgroups(mut self) -> Self {
+        self.deliver_all_subgroups = true;
+        self
     }
 
     /// Create a new stream with the given priority, inserting it into the track.
@@ -112,7 +128,7 @@ impl TrackWriter {
         let (writer, reader) = Subgroups {
             track: self.info.clone(),
         }
-        .produce();
+        .produce_with(self.deliver_all_subgroups);
 
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {

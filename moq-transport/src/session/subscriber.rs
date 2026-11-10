@@ -5,7 +5,7 @@
 use std::{
     collections::{hash_map, HashMap, HashSet},
     io,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
     data,
+    instrument::TokenBucket,
     message::{self, Message, RequestErrorCode, SubscribeOptions},
     mlog,
     serve::{self, FullTrackName, ServeError},
@@ -105,6 +106,11 @@ pub struct Subscriber {
     fatal_errors: Queue<SessionError>,
 
     session_lifetime: CancellationToken,
+
+    /// Optional pacing of inbound data-stream reads, shared by all clones so
+    /// it can be installed after the session has started. Experiment tooling
+    /// only; see [`Subscriber::set_recv_throttle`].
+    recv_throttle: Arc<OnceLock<Arc<TokenBucket>>>,
 }
 
 /// RAII guard that rolls back a SUBSCRIBE_NAMESPACE prefix reservation on failure.
@@ -287,11 +293,22 @@ impl Subscriber {
             session_id,
             fatal_errors,
             session_lifetime,
+            recv_throttle: Default::default(),
         }
     }
 
     pub(super) fn report_fatal(&self, error: SessionError) {
         let _ = self.fatal_errors.clone().push(error);
+    }
+
+    /// Pace reads of inbound data streams through `throttle`.
+    ///
+    /// Emulates a slow receiver for experiments: once the bucket runs dry the
+    /// session stops reading from QUIC, the receive windows fill, and flow
+    /// control pushes back on the peer. Can be set once per session; returns
+    /// false if a throttle was already installed.
+    pub fn set_recv_throttle(&self, throttle: Arc<TokenBucket>) -> bool {
+        self.recv_throttle.set(throttle).is_ok()
     }
 
     /// Correlation id of the session this subscriber belongs to.
@@ -1363,7 +1380,8 @@ impl Subscriber {
         stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
         tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
-        let mut reader = Reader::new(self.session_id.clone(), stream);
+        let mut reader = Reader::new(self.session_id.clone(), stream)
+            .with_throttle(self.recv_throttle.get().cloned());
 
         // Decode the stream header
         let stream_header: data::StreamHeader = reader.decode().await?;

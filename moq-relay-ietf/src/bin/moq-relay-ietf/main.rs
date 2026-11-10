@@ -111,6 +111,51 @@ pub struct Cli {
     /// See the moq-relay-ietf README for the format.
     #[arg(long, env = "MOQ_RELAY_SCOPE_CONFIG")]
     pub scope_config: Option<PathBuf>,
+
+    /// Experiment instrumentation: append one JSON line per interval with
+    /// per-session bytes sent, queued bytes, in-flight subgroups and lag.
+    /// Off by default.
+    #[arg(long)]
+    pub bench_stats_file: Option<PathBuf>,
+
+    /// Sampling interval for --bench-stats-file, in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub bench_stats_interval_ms: u64,
+
+    /// Experiment setup: cap the aggregate rate at which subgroup payload is
+    /// handed to QUIC across all downstream sessions (shared FIFO token
+    /// bucket), in megabits per second. Off by default.
+    #[arg(long)]
+    pub send_rate_limit_mbps: Option<f64>,
+
+    /// Burst size for --send-rate-limit-mbps, in bytes.
+    #[arg(long, default_value_t = 64 * 1024)]
+    pub send_rate_burst_bytes: u64,
+}
+
+/// Periodically append [`moq_transport::instrument::snapshot`] to `path` as JSON lines.
+async fn write_bench_stats(path: PathBuf, interval: Duration) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        // Sizing walks every in-flight subgroup; keep it off the async workers.
+        let snapshot = tokio::task::spawn_blocking(moq_transport::instrument::snapshot).await?;
+        if let Some(snapshot) = snapshot {
+            let mut line = serde_json::to_vec(&snapshot)?;
+            line.push(b'\n');
+            file.write_all(&line).await?;
+            file.flush().await?;
+        }
+    }
 }
 
 #[tokio::main]
@@ -183,6 +228,31 @@ async fn main() -> anyhow::Result<()> {
             "--metrics-addr was provided but the metrics-prometheus feature is not enabled. \
              Rebuild with --features metrics-prometheus to enable the Prometheus exporter."
         );
+    }
+
+    if let Some(mbps) = cli.send_rate_limit_mbps {
+        anyhow::ensure!(
+            mbps.is_finite() && mbps > 0.0,
+            "--send-rate-limit-mbps must be positive"
+        );
+        let bytes_per_sec = (mbps * 1_000_000.0 / 8.0) as u64;
+        moq_transport::instrument::set_send_rate_limit(bytes_per_sec, cli.send_rate_burst_bytes);
+        tracing::info!(
+            mbps,
+            burst = cli.send_rate_burst_bytes,
+            "send rate limit enabled"
+        );
+    }
+
+    if let Some(path) = cli.bench_stats_file.clone() {
+        moq_transport::instrument::enable();
+        let interval = Duration::from_millis(cli.bench_stats_interval_ms.max(10));
+        tracing::info!(path = %path.display(), ?interval, "bench stats enabled");
+        tokio::spawn(async move {
+            if let Err(err) = write_bench_stats(path, interval).await {
+                tracing::error!(error = %err, "bench stats writer stopped");
+            }
+        });
     }
 
     let tls = cli.tls.load()?;

@@ -1663,6 +1663,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures",
+ "moq-native-ietf",
+ "moq-transport",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "moq-catalog"
 version = "0.2.3"
 dependencies = [

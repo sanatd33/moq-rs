@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{cmp, io};
+use std::{cmp, io, sync::Arc};
 
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
     coding::{Decode, DecodeError},
     data::{FetchRecord, FetchRecordDecoder, MAX_FETCH_RECORD_HEADER_SIZE},
+    instrument::TokenBucket,
 };
 
 use super::{SessionError, SessionId};
@@ -17,6 +18,7 @@ pub struct Reader {
     session_id: SessionId,
     stream: web_transport::RecvStream,
     buffer: BytesMut,
+    throttle: Option<Arc<TokenBucket>>,
 }
 
 impl Reader {
@@ -25,6 +27,21 @@ impl Reader {
             session_id,
             stream,
             buffer: Default::default(),
+            throttle: None,
+        }
+    }
+
+    /// Pace reads from the underlying stream through `throttle`.
+    pub fn with_throttle(mut self, throttle: Option<Arc<TokenBucket>>) -> Self {
+        self.throttle = throttle;
+        self
+    }
+
+    /// Charge `n` freshly read bytes to the throttle. Waiting here delays the
+    /// next read, so QUIC flow control (not this buffer) absorbs the backlog.
+    async fn pace(&self, n: usize) {
+        if let Some(throttle) = &self.throttle {
+            throttle.acquire(n).await;
         }
     }
 
@@ -93,6 +110,7 @@ impl Reader {
                 };
 
                 let read_amount = self.buffer.len() - before_read;
+                self.pace(read_amount).await;
                 tracing::trace!(
                     "[READER] decode: read {} bytes from stream (buffer_len={})",
                     read_amount,
@@ -130,6 +148,7 @@ impl Reader {
 
         let chunk = self.stream.read(max).await?;
         if let Some(ref data) = chunk {
+            self.pace(data.len()).await;
             tracing::trace!("[READER] read_chunk: read {} bytes from stream", data.len());
         } else {
             tracing::trace!("[READER] read_chunk: stream returned None");

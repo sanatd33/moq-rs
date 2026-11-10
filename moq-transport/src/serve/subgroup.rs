@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{cmp, collections::VecDeque, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
@@ -25,7 +25,17 @@ pub struct Subgroups {
 
 impl Subgroups {
     pub fn produce(self) -> (SubgroupsWriter, SubgroupsReader) {
-        let (writer, reader) = State::default().split();
+        self.produce_with(false)
+    }
+
+    /// Like [`produce`](Self::produce), but with `deliver_all` every created
+    /// subgroup is queued for the reader instead of only the latest one.
+    pub fn produce_with(self, deliver_all: bool) -> (SubgroupsWriter, SubgroupsReader) {
+        let (writer, reader) = State::new(SubgroupsState {
+            queue: deliver_all.then(VecDeque::new),
+            ..Default::default()
+        })
+        .split();
 
         let writer = SubgroupsWriter::new(writer, self.track.clone());
         let reader = SubgroupsReader::new(reader, self.track);
@@ -47,6 +57,11 @@ struct SubgroupsState {
     latest_subgroup_reader: Option<SubgroupReader>,
     epoch: u64, // Updated each time latest changes
     closed: Result<(), ServeError>,
+    /// When set, every created subgroup (including late, older ones) is queued
+    /// and handed out once by `SubgroupsReader::next`, instead of readers only
+    /// seeing the latest. Intended for a single consumer that must not lose
+    /// streams, such as a measurement client. Unset everywhere by default.
+    queue: Option<VecDeque<SubgroupReader>>,
 }
 
 impl Default for SubgroupsState {
@@ -55,6 +70,7 @@ impl Default for SubgroupsState {
             latest_subgroup_reader: None,
             epoch: 0,
             closed: Ok(()),
+            queue: None,
         }
     }
 }
@@ -107,6 +123,10 @@ impl SubgroupsWriter {
         let (writer, reader) = subgroup.produce();
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+
+        if let Some(queue) = &mut state.queue {
+            queue.push_back(reader.clone());
+        }
 
         if let Some(latest) = &state.latest_subgroup_reader {
             // TODO: Check this logic again
@@ -174,7 +194,15 @@ impl SubgroupsReader {
             {
                 let state = self.state.lock();
 
-                if self.epoch != state.epoch {
+                if let Some(queue) = &state.queue {
+                    if !queue.is_empty() {
+                        // Writer gone: nothing can mutate the queue, end here.
+                        let Some(mut state) = state.into_mut() else {
+                            return Ok(None);
+                        };
+                        return Ok(state.queue.as_mut().and_then(|q| q.pop_front()));
+                    }
+                } else if self.epoch != state.epoch {
                     self.epoch = state.epoch;
                     return Ok(state.latest_subgroup_reader.clone());
                 }
@@ -430,6 +458,22 @@ impl SubgroupReader {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Payload bytes received into this subgroup so far, across all objects.
+    ///
+    /// Used by [`crate::instrument`] to measure cached data a downstream
+    /// subscription still references. Clones the object list under the
+    /// subgroup lock and sums outside it, so object locks never nest inside.
+    pub fn buffered_bytes(&self) -> u64 {
+        let objects = self.state.lock().objects.clone();
+        objects.iter().map(|o| o.received_bytes()).sum()
+    }
+
+    /// Identity of the shared subgroup cache entry, for de-duplicating
+    /// memory across subscribers that reference the same cached subgroup.
+    pub fn cache_id(&self) -> usize {
+        Arc::as_ptr(&self.info) as usize
+    }
 }
 
 impl Deref for SubgroupReader {
@@ -610,6 +654,12 @@ impl SubgroupObjectReader {
         }
     }
 
+    /// Payload bytes received for this object so far.
+    pub fn received_bytes(&self) -> u64 {
+        let state = self.state.lock();
+        state.chunks.iter().map(|c| c.len() as u64).sum()
+    }
+
     pub async fn read_all(&mut self) -> Result<Bytes, ServeError> {
         let mut chunks = Vec::new();
         while let Some(chunk) = self.read().await? {
@@ -640,6 +690,55 @@ mod tests {
             "test-track".to_string(),
         ));
         Subgroups { track }.produce()
+    }
+
+    #[tokio::test]
+    async fn deliver_all_hands_out_every_subgroup_in_creation_order() {
+        let track = Arc::new(Track::new(
+            TrackNamespace::from_utf8_path("test/ns"),
+            "test-track".to_string(),
+        ));
+        let (mut writer, mut reader) = Subgroups { track }.produce_with(true);
+
+        // A burst including a late, older group, created before the reader polls.
+        let mut writers = Vec::new();
+        for group_id in [0, 2, 1] {
+            let mut w = writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 0,
+                })
+                .unwrap();
+            w.write(payload(group_id, 0)).unwrap();
+            writers.push(w);
+        }
+
+        for expected in [0, 2, 1] {
+            let mut sg = reader.next().await.unwrap().unwrap();
+            assert_eq!(sg.group_id, expected);
+            assert_eq!(sg.read_next().await.unwrap(), Some(payload(expected, 0)));
+        }
+    }
+
+    #[tokio::test]
+    async fn default_mode_still_skips_to_latest() {
+        let (mut writer, mut reader) = make_subgroups();
+        let _a = writer
+            .create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let _b = writer
+            .create(Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        assert_eq!(reader.next().await.unwrap().unwrap().group_id, 1);
     }
 
     /// Helper: deterministic payload for (group_id, object_id).

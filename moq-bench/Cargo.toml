@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "moq-bench"
+description = "Load generators for MoQT relay resource-isolation experiments"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+moq-native-ietf = { path = "../moq-native-ietf" }
+moq-transport = { path = "../moq-transport" }
+
+url = "2"
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }

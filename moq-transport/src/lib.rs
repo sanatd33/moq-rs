@@ -11,6 +11,7 @@
 pub mod coding;
 pub mod data;
 pub mod error;
+pub mod instrument;
 pub mod message;
 pub mod mlog;
 pub mod reexports {
